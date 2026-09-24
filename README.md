@@ -15,12 +15,12 @@
 
 ## 在线预览
 
-> 把 `<用户名>` 换成你自己的 GitHub 用户名，推到 GitHub 并在仓库
-> **Settings → Pages → Source = Deploy from a branch → main / docs** 打开即可：
->
-> `https://<用户名>.github.io/delta-force-vehicle-viewer/`
+**<https://minecraforever.github.io/delta-force-vehicle-viewer/>**
 
-不想等 Pages 生效也可以本地跑，见下面的「快速开始」。
+站点目录就是 `docs/`，仓库 **Settings → Pages → Deploy from a branch → main / docs** 即可发布。
+刚推送完或刚更新时，Pages 可能有 1–2 分钟构建延迟。
+
+不想等 Pages 也可以本地跑，见下面的「快速开始」。
 
 ## 能看什么
 
