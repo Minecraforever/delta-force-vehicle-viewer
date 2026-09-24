@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# 编辑器 / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 本地草稿：开发自检页、临时脚本，不入库
+_scratch/
+
+# 日志
+*.log
+
+# 依赖（本项目没有构建步骤，留着以防万一）
+node_modules/

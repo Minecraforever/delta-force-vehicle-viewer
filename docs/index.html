@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>三角洲行动 · 全面战场载具可视化</title>
+<link rel="stylesheet" href="./style.css" />
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three.module.js",
+    "three/addons/": "./vendor/"
+  }
+}
+</script>
+</head>
+<body>
+<header>
+  <div class="title">三角洲行动 · 全面战场载具可视化</div>
+  <div class="subtitle">基于 1.101.37117.36 版本 · 作者 SZU丶b0外骨骼｜深圳大学战队、Bilibili 的
+  <a href="https://space.bilibili.com/670174785" target="_blank" rel="noopener">Minecraforever</a></div>
+  <div class="controls">
+    <label><input type="checkbox" id="showModels" checked /> 车体</label>
+    <button id="soloCollision" title="隐藏主模型，只留下实车碰撞体，方便看子弹判定体">只看碰撞体</button>
+    <label><input type="checkbox" id="showAxes" /> 坐标轴</label>
+    <label><input type="checkbox" id="autoRotate" /> 自动旋转</label>
+    <button id="resetView">重置视角</button>
+  </div>
+</header>
+
+<main>
+  <aside id="vehicleList">
+    <h2>载具</h2>
+    <div id="vehicleGroups"></div>
+  </aside>
+
+  <section id="viewport">
+    <canvas id="scene"></canvas>
+    <div id="labels"></div>
+
+    <div id="viewbar">
+      <span class="viewbar-title">视角</span>
+      <button class="view-btn active" data-view="3d">立体</button>
+      <button class="view-btn" data-view="front">前视</button>
+      <button class="view-btn" data-view="side">侧视</button>
+      <button class="view-btn" data-view="top">俯视</button>
+      <button class="view-btn" data-view="rear">后视</button>
+      <label class="explode">分解
+        <input type="range" id="explode" min="0" max="100" value="0" />
+      </label>
+      <label class="explode">盒透明
+        <input type="range" id="boxAlpha" min="2" max="60" value="10" />
+      </label>
+    </div>
+
+    <div id="layerbar">
+      <div class="layer-group">
+        <span class="viewbar-title" title="蓝图里 VehicleHitPartInfos 写的长方体，决定“打中哪里、伤害乘多少”">部位命中盒</span>
+        <label class="layer" title="显示 / 隐藏部位命中盒（彩色方块）">
+          <input type="checkbox" id="showBoxes" checked /> 显示</label>
+        <label class="layer" title="关掉后只留线框，车体和碰撞体看得更清楚">
+          <input type="checkbox" id="boxFill" checked /> 填充</label>
+        <label class="layer" title="在每个命中盒上标出名称与伤害倍率">
+          <input type="checkbox" id="showLabels" checked /> 部位标签</label>
+      </div>
+      <span class="layer-sep"></span>
+      <div class="layer-group">
+        <span class="viewbar-title" title="都是和命中判定无关的碰撞体，默认全部关闭；鼠标悬停可看每个是什么">其他碰撞体</span>
+        <label class="layer" title="载具撞击碰撞盒：车撞车 / 车撞人时用的物理块（DFMVehicleCollisionComponent 的主盒 + 附加盒）">
+          <input type="checkbox" class="layer-toggle" data-layer="impact" /> 载具撞击盒</label>
+        <label class="layer" title="底盘物理盒：底盘贴地那一层扁盒，管接地与翻越">
+          <input type="checkbox" class="layer-toggle" data-layer="chassis" /> 底盘物理盒</label>
+        <label class="layer" title="AI 导航盒：NavArea_Obstacle 阻挡寻路、NavArea_Null 在导航网格上挖洞">
+          <input type="checkbox" class="layer-toggle" data-layer="nav" /> AI 导航盒</label>
+        <label class="layer" title="装配体盒：DFMVehicleAssembledComponent 的装配分区，编辑器辅助用，不参与战斗结算">
+          <input type="checkbox" class="layer-toggle" data-layer="assembly" /> 装配体盒</label>
+        <label class="layer" title="实车碰撞体：每个外观件的 *_COL 简化网格，子弹与投射物就是打在这上面">
+          <input type="checkbox" class="layer-toggle" data-layer="colmesh" /> 实车碰撞体</label>
+      </div>
+      <button id="layerHelpBtn" title="每种盒分别是什么、有什么用">盒说明</button>
+    </div>
+
+    <div id="layerHelp" hidden>
+      <h3>四种碰撞 + 部位命中盒</h3>
+      <table>
+        <tr><th>#</th><th>名称</th><th>作用</th><th>形状 / 来源</th></tr>
+        <tr>
+          <td>1</td><td><span class="swatch colmesh"></span>实车碰撞体</td>
+          <td>子弹、投射物打到车上的判定体；没有整体判定盒，就是各外观件判定体的并集</td>
+          <td>每个外观件自己的简化网格 <code>*_COL</code></td>
+        </tr>
+        <tr>
+          <td>2</td><td><span class="swatch side"></span>部位命中盒</td>
+          <td>决定“打中哪里、伤害乘多少、能不能忽略结算”</td>
+          <td>蓝图 <code>VehicleHitPartInfos</code> 的长方体</td>
+        </tr>
+        <tr>
+          <td>3</td><td><span class="swatch impact"></span>载具撞击盒</td>
+          <td>车撞车 / 车撞人时的物理块，和子弹判定无关</td>
+          <td><code>DFMVehicleCollisionComponent</code> 主盒 + 附加盒</td>
+        </tr>
+        <tr>
+          <td>4</td><td><span class="swatch chassis"></span>底盘物理盒</td>
+          <td>底盘贴地的那层扁盒，管接地与越障</td>
+          <td><code>GPAdvancedBoxComponent</code></td>
+        </tr>
+        <tr>
+          <td>5</td><td><span class="swatch nav"></span>AI 导航盒</td>
+          <td>给 AI 寻路用：阻挡，或在导航网格上挖洞</td>
+          <td><code>BoxComponent</code> 的 <code>NavArea_*</code></td>
+        </tr>
+        <tr>
+          <td>6</td><td><span class="swatch assembly"></span>装配体盒</td>
+          <td>装配分区，编辑器辅助用，不参与战斗结算</td>
+          <td><code>DFMVehicleAssembledComponent.BoxDataInfos</code></td>
+        </tr>
+      </table>
+      <div class="owner">想单独看某一层时，把主模型（顶部“车体”）关掉即可；点“只看碰撞体”会一次把模型关掉、并只留实车碰撞体。</div>
+    </div>
+
+    <div id="legend">
+      <div><span class="swatch engine"></span>发动机舱 ×1.5</div>
+      <div><span class="swatch front"></span>前部车体 ×0.8</div>
+      <div><span class="swatch side"></span>侧面/顶部 ×1.0</div>
+      <div><span class="swatch track"></span>履带（独立耐久）</div>
+      <div><span class="swatch turret"></span>炮塔/武器站</div>
+      <div><span class="swatch ignore"></span>不参与伤害结算</div>
+      <div><span class="swatch impact"></span>载具撞击碰撞盒</div>
+      <div><span class="swatch chassis"></span>底盘物理盒</div>
+      <div><span class="swatch nav"></span>AI 导航盒</div>
+      <div><span class="swatch assembly"></span>装配体盒</div>
+      <div><span class="swatch colmesh"></span>实车碰撞体</div>
+    </div>
+    <div id="hint">左键旋转 · 右键平移 · 滚轮缩放 · 点击方块查看部位</div>
+    <div id="status"></div>
+  </section>
+
+  <aside id="detailPanel">
+    <div id="vehicleInfo"></div>
+    <div id="boxInfo"></div>
+    <div id="boxListCard"></div>
+  </aside>
+</main>
+
+<footer>
+  <nav>
+    <button class="tab active" data-tab="weapons">载具武器伤害</button>
+    <button class="tab" data-tab="gadgets">步兵/干员道具</button>
+    <button class="tab" data-tab="sim">命中模拟</button>
+    <button class="tab" data-tab="repair">修复规则</button>
+  </nav>
+  <div id="tableArea"></div>
+</footer>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>

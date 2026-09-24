@@ -1,0 +1,21 @@
+# 仓库内文本文件统一用 LF，检出时按平台需要转换
+* text=auto eol=lf
+
+# Windows 脚本必须是 CRLF，否则 cmd.exe 偶发解析异常
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+*.ps1  text eol=crlf
+
+# macOS 启动器必须是 LF，并且要保住可执行位
+start-mac.command text eol=lf
+
+# 二进制资产：禁止换行符/编码转换，diff 里也不显示
+*.glb  binary
+*.bin  binary
+*.jpg  binary
+*.jpeg binary
+*.png  binary
+*.webp binary
+
+# 第三方库不计入仓库语言统计
+docs/vendor/** linguist-vendored
