@@ -22,7 +22,7 @@ SOFTWARE.
 
 --------------------------------------------------------------------------
 
-注意：本许可证只覆盖本仓库的**代码**（页面、脚本、数据处理逻辑）。
-docs/models、docs/data 等目录下的模型、贴图与游戏数据来自《三角洲行动》
-客户端解包，版权归游戏开发商 / 发行商及其权利人所有，不在 MIT 授权范围内。
-详见 NOTICE.md。
+This license covers the source code in this repository only (page, scripts,
+launchers). The models, textures and data under docs/ were exported from the
+Delta Force game client and remain the property of their owners; they are not
+covered by the MIT license. See the "Assets and copyright" section in README.md.
