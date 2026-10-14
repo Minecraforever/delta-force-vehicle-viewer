@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="icon" href="data:," />
 <title>三角洲行动 · 全面战场载具可视化</title>
 <link rel="stylesheet" href="./style.css" />
 <script type="importmap">
@@ -25,6 +26,7 @@
     <label><input type="checkbox" id="showAxes" /> 坐标轴</label>
     <label><input type="checkbox" id="autoRotate" /> 自动旋转</label>
     <button id="resetView">重置视角</button>
+    <button id="toggleView" title="收起三维视图，把窗口高度让给下面的伤害表">收起视图</button>
   </div>
 </header>
 
@@ -145,8 +147,9 @@
 <footer>
   <nav>
     <button class="tab active" data-tab="weapons">载具武器伤害</button>
-    <button class="tab" data-tab="gadgets">步兵/干员道具</button>
+    <button class="tab" data-tab="gadgets">步兵技能伤害</button>
     <button class="tab" data-tab="sim">命中模拟</button>
+    <button class="tab" data-tab="collision">碰撞 / 碾压规则</button>
     <button class="tab" data-tab="repair">修复规则</button>
   </nav>
   <div id="tableArea"></div>

@@ -28,7 +28,8 @@ docs/               the site, and the GitHub Pages source
   app.js style.css  front end
   vendor/           three.js r160 + loaders and controls
   data/             vehicle data: hitboxes, parts, collision volumes, damage tables
-  models/<name>/    18 vehicles as .glb meshes with .jpg textures
+  models.*.mfpk    20 vehicles and textures in three data packages
+  models.manifest.json  package index
 start-mac.command   macOS launcher
 start-windows.cmd   Windows launcher
 start-windows.ps1   its server implementation

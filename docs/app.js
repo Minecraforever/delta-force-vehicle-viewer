@@ -44,7 +44,7 @@ const state = {
   hideZero: false,
   showAllArmor: false,
   showExplain: false,
-  sim: { name: '', boxIndex: -1, angle: 0 },
+  sim: { name: '', boxIndex: -1, angle: 0, distance: 0 },
   view: '3d',
   bounds: null,
   layers: { impact: false, chassis: false, nav: false, assembly: false, colmesh: false },
@@ -57,10 +57,61 @@ let boxMeshes = [];
 let labelLayer, hoverLabel;
 let boxListEl;
 let collisionMeshMaterials = [];
+/* 每次换车 +1 的令牌：异步加载回来的旧车数据一律作废，防止两辆车的模型叠在一起 */
+let modelToken = 0;
 
 const gltfLoader = new GLTFLoader();
 const texLoader = new THREE.TextureLoader();
 const textureCache = new Map();
+
+/* 构建版本：改动后 +1，拼到请求上，避免浏览器 / 内嵌 WebView 缓存旧模型包与旧数据 */
+const APP_BUILD = '20261014.4';
+const bust = (u) => (/\?/.test(u) ? u + '&v=' : u + '?v=') + APP_BUILD;
+
+/* ---------------------------- MFPK 打包加载 ---------------------------- */
+/* GLB + 贴图按载具类型拆进多个 models.*.mfpk（每个 < 100MB），
+   先读 models.manifest.json 拿到 URL->包名，再按包名懒加载。 */
+let mfpkManifest = null;
+const mfpkPackages = new Map();
+
+async function parseMfpk(url) {
+  const buf = await (await fetch(url)).arrayBuffer();
+  if (new TextDecoder().decode(new Uint8Array(buf, 0, 4)) !== 'MFPK') throw new Error('bad mfpk magic');
+  const view = new DataView(buf);
+  const indexBytes = view.getUint32(12, true);
+  const index = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 16, indexBytes)));
+  let off = 16 + Math.ceil(indexBytes / 4) * 4;
+  const entries = new Map();
+  for (const e of index.entries) {
+    entries.set(e.name, { kind: e.kind, offset: off, size: e.size, mime: e.mime });
+    off += e.size + ((4 - e.size % 4) % 4);
+  }
+  return { buf, entries, loader: new GLTFLoader() };
+}
+
+async function loadMfpkManifest() {
+  if (mfpkManifest) return mfpkManifest;
+  try {
+    const res = await fetch(bust('models.manifest.json'));
+    mfpkManifest = await res.json();
+  } catch (error) {
+    mfpkManifest = {};
+  }
+  return mfpkManifest;
+}
+
+function getMfpk(pkgName) {
+  if (!mfpkPackages.has(pkgName)) {
+    mfpkPackages.set(pkgName, parseMfpk(bust(pkgName)).catch(() => null));
+  }
+  return mfpkPackages.get(pkgName);
+}
+
+async function mfpkFor(url) {
+  const manifest = await loadMfpkManifest();
+  const pkgName = manifest[url];
+  return pkgName ? getMfpk(pkgName) : null;
+}
 
 init();
 
@@ -70,7 +121,7 @@ async function init() {
   bindControls();
 
   const params = new URLSearchParams(location.search);
-  const response = await fetch('./data/vehicles.json');
+  const response = await fetch(bust('./data/vehicles.json'));
   state.data = await response.json();
   renderVehicleList();
 
@@ -200,6 +251,7 @@ function resize() {
   const viewport = document.getElementById('viewport');
   const w = viewport.clientWidth;
   const h = viewport.clientHeight;
+  if (!w || !h) return; // 收起视图后画布尺寸为 0，跳过以免把宽高比算成 NaN
   renderer.setSize(w, h, false);
   perspCamera.aspect = w / h;
   perspCamera.updateProjectionMatrix();
@@ -244,6 +296,21 @@ function bindControls() {
   document.getElementById('resetView').addEventListener('click', () => {
     setView('3d');
     fitCamera();
+  });
+  // 收起三维视图：把高度让给下面的伤害表 / 模拟面板（评论区要的「模型窗口可以关掉」）
+  document.getElementById('toggleView').addEventListener('click', (e) => {
+    const collapsed = document.body.classList.toggle('view-collapsed');
+    e.target.textContent = collapsed ? '展开视图' : '收起视图';
+    // 三面板重排：收起视图后把底部数据表挪到中间（原视图位置），
+    // 变成「载具列表 | 数据表 | 详情」三栏；展开时再放回底部。
+    const footer = document.querySelector('footer');
+    const main = document.querySelector('main');
+    if (collapsed) {
+      main.insertBefore(footer, document.getElementById('detailPanel'));
+    } else {
+      document.body.appendChild(footer);
+    }
+    if (!collapsed) resize();
   });
   document.getElementById('soloCollision').addEventListener('click', () => {
     // 只留实车碰撞体：关模型、关部位盒、只开 *_COL 那一层
@@ -320,8 +387,11 @@ function applyView() {
 /* ---------------------------- 载具列表 ---------------------------- */
 
 function renderVehicleList() {
-  const groups = { 地面: [], 空中: [], 水上: [], 其他: [] };
-  state.data.vehicles.forEach((v) => (groups[v.domain] || groups.其他).push(v));
+  const groups = { 地面: [], 空中: [], 水上: [], 摩加迪沙: [], 其他: [] };
+  state.data.vehicles.forEach((v) => {
+    if (v.mode === '摩加迪沙') { groups['摩加迪沙'].push(v); return; }
+    (groups[v.domain] || groups['其他']).push(v);
+  });
   const container = document.getElementById('vehicleGroups');
   container.innerHTML = '';
   Object.entries(groups).forEach(([domain, list]) => {
@@ -362,22 +432,6 @@ function selectVehicle(id) {
 
 /* ---------------------------- 车体加载 ---------------------------- */
 
-function loadTexture(url) {
-  if (textureCache.has(url)) return textureCache.get(url);
-  const promise = new Promise((resolve) => {
-    texLoader.load(url, (tex) => {
-      tex.colorSpace = THREE.SRGBColorSpace;
-      tex.anisotropy = 4;
-      // glTF 的 UV 原点在左上，three.js 默认要翻 V；不关掉的话轮胎、车号这些
-      // 有明确上下方向的地方会整体错位（轮毂对不上轮心、编号倒过来）。
-      tex.flipY = false;
-      resolve(tex);
-    }, undefined, () => resolve(null));
-  });
-  textureCache.set(url, promise);
-  return promise;
-}
-
 const gltfCache = new Map();
 
 /**
@@ -405,17 +459,58 @@ function flattenSkinned(scene) {
 
 function loadGltf(url) {
   if (!gltfCache.has(url)) {
-    gltfCache.set(url, new Promise((resolve) => {
-      gltfLoader.load(url, (gltf) => {
-        flattenSkinned(gltf.scene);
-        resolve(gltf);
-      }, undefined, (error) => {
-        console.error('模型加载失败', url, error);
-        resolve(null);
+    gltfCache.set(url, (async () => {
+      const pkg = await mfpkFor(url);
+      if (pkg && pkg.entries.has(url)) {
+        const entry = pkg.entries.get(url);
+        try {
+          const gltf = await pkg.loader.parseAsync(pkg.buf.slice(entry.offset, entry.offset + entry.size), '');
+          flattenSkinned(gltf.scene);
+          return gltf;
+        } catch (error) {
+          console.error('模型加载失败(MFPK)', url, error);
+          return null;
+        }
+      }
+      return new Promise((resolve) => {
+        gltfLoader.load(bust(url), (gltf) => {
+          flattenSkinned(gltf.scene);
+          resolve(gltf);
+        }, undefined, (error) => {
+          console.error('模型加载失败', url, error);
+          resolve(null);
+        });
       });
-    }));
+    })());
   }
   return gltfCache.get(url);
+}
+
+function loadTexture(url) {
+  if (textureCache.has(url)) return textureCache.get(url);
+  const promise = (async () => {
+    const apply = (tex) => {
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.anisotropy = 4;
+      tex.flipY = false;
+      return tex;
+    };
+    const pkg = await mfpkFor(url);
+    if (pkg && pkg.entries.has(url)) {
+      const entry = pkg.entries.get(url);
+      const blob = new Blob([pkg.buf.slice(entry.offset, entry.offset + entry.size)],
+        { type: entry.mime || 'image/jpeg' });
+      const objUrl = URL.createObjectURL(blob);
+      return new Promise((resolve) => {
+        texLoader.load(objUrl, (tex) => resolve(apply(tex)), undefined, () => resolve(null));
+      });
+    }
+    return new Promise((resolve) => {
+      texLoader.load(bust(url), (tex) => resolve(apply(tex)), undefined, () => resolve(null));
+    });
+  })();
+  textureCache.set(url, promise);
+  return promise;
 }
 
 async function loadMaterialSet(entry) {
@@ -450,49 +545,71 @@ function place(object, loc, quat, scale) {
   if (scale) object.scale.set(scale[0], scale[1], scale[2]);
 }
 
+/**
+ * 加载当前载具的全部外观件。
+ *
+ * 模型是异步下载的，而玩家可能在中途连着点好几辆车：如果不做处理，先点的那辆车
+ * 会在「已经清过场」之后才把网格挂进来，屏幕上就出现两辆车叠在一起（例如轻坦压在
+ * AAV 上）。所以每次调用先领一个令牌，任何 await 回来之后只要令牌已经不是最新的
+ * 就直接退出，绝不往场景里塞东西。
+ */
 async function buildModel() {
+  const token = ++modelToken;
+  const stale = () => token !== modelToken;
+  const vehicle = state.vehicle;
+
   modelGroup.clear();
+  modelGroup.userData.parts = [];
   modelGroup.visible = state.showModels;
   Object.values(layerGroups).forEach((g) => g.clear());
+  collisionMeshMaterials = [];
 
-  const allParts = state.vehicle.modelParts || [];
+  const status = document.getElementById('status');
+  if (status) status.textContent = `载入 ${vehicle.name}…`;
+
+  const allParts = vehicle.modelParts || [];
   const parts = allParts.filter((part) => !part.unplaced);
   const loaded = await Promise.all(parts.map(async (part) => {
     const gltf = await loadGltf(part.url);
-    if (!gltf) return null;
+    if (!gltf || stale()) return null;
     applyMaterials(gltf.scene, await loadMaterialSet(part));
+    if (stale()) return null;
     return { part, object: gltf.scene.clone(true) };
   }));
+  if (stale()) return;
 
-  await buildWheels();
-  await buildTracks();
-  await buildCollisionMeshes();
-  buildCollisionBoxes();
+  await buildWheels(token, vehicle);
+  if (stale()) return;
+  await buildTracks(token, vehicle);
+  if (stale()) return;
+  await buildCollisionMeshes(token, vehicle);
+  if (stale()) return;
+  buildCollisionBoxes(vehicle);
 
   const ok = loaded.filter(Boolean).length;
-  const volumes = state.vehicle.hitBoxes.filter((b) => !b.point).length;
-  const status = document.getElementById('status');
+  const volumes = vehicle.hitBoxes.filter((b) => !b.point).length;
   const skipped = allParts.length - parts.length;
   if (status) {
     status.textContent = `外观件 ${ok}/${parts.length}`
-      + ` · 轮 ${(state.vehicle.modelWheels || []).reduce((n, w) => n + w.transforms.length, 0)}`
-      + ` · 履带 ${(state.vehicle.modelTracks || []).length}`
+      + ` · 轮 ${(vehicle.modelWheels || []).reduce((n, w) => n + w.transforms.length, 0)}`
+      + ` · 履带 ${(vehicle.modelTracks || []).length}`
       + ` · 命中盒 ${volumes}`
       + (skipped ? ` · 未定位 ${skipped}` : '');
   }
   modelGroup.userData.parts = loaded.filter(Boolean);
   modelGroup.userData.parts.forEach(({ object }) => modelGroup.add(object));
   layoutParts();
-  computeBounds();
+  computeBounds(vehicle);
   applyView();
 }
 
 /* 实例化轮组：位置直接来自蓝图 InitWheelTransforms */
-async function buildWheels() {
-  for (const group of state.vehicle.modelWheels || []) {
+async function buildWheels(token, vehicle) {
+  for (const group of vehicle.modelWheels || []) {
     const gltf = await loadGltf(group.url);
-    if (!gltf) continue;
+    if (!gltf || token !== modelToken) return;
     const textures = await loadMaterialSet(group);
+    if (token !== modelToken) return;
     applyMaterials(gltf.scene, textures);
     group.transforms.forEach((transform) => {
       const object = gltf.scene.clone(true);
@@ -505,11 +622,12 @@ async function buildWheels() {
 /* 履带链节：沿蓝图样条按 TrackSize 等距铺链节 */
 const TRACK_LINK_LIMIT = 200;
 
-async function buildTracks() {
-  for (const track of state.vehicle.modelTracks || []) {
+async function buildTracks(token, vehicle) {
+  for (const track of vehicle.modelTracks || []) {
     const gltf = await loadGltf(track.url);
-    if (!gltf) continue;
+    if (!gltf || token !== modelToken) return;
     const textures = await loadMaterialSet(track);
+    if (token !== modelToken) return;
     const offset = toVec3(track.loc);
     const curve = new THREE.CatmullRomCurve3(
       track.points.map((p) => toVec3(p).add(offset)), false, 'catmullrom', 0.5);
@@ -530,12 +648,11 @@ async function buildTracks() {
 }
 
 /* _COL 简化碰撞网格：贴着对应外观件画一层淡青色“碰撞皮” */
-async function buildCollisionMeshes() {
-  collisionMeshMaterials = [];
-  for (const entry of state.vehicle.collisionMeshes || []) {
+async function buildCollisionMeshes(token, vehicle) {
+  for (const entry of vehicle.collisionMeshes || []) {
     const gltf = await loadGltf(entry.url);
-    if (!gltf) continue;
-    const part = entry.partIndex >= 0 ? state.vehicle.modelParts[entry.partIndex] : null;
+    if (!gltf || token !== modelToken) return;
+    const part = entry.partIndex >= 0 ? vehicle.modelParts[entry.partIndex] : null;
     gltf.scene.traverse((child) => {
       if (!child.isMesh) return;
       // 车体关掉时这份碰撞体会被单独查看，所以要让它可以变实一点、双面可见
@@ -562,8 +679,8 @@ function refreshCollisionMeshStyle() {
 }
 
 /* 车辆撞击 / 底盘 / AI 导航 / 装配体：只画线框，避免盖住部位盒 */
-function buildCollisionBoxes() {
-  const layers = state.vehicle.collisionLayers || {};
+function buildCollisionBoxes(vehicle) {
+  const layers = vehicle.collisionLayers || {};
   Object.entries(LAYER_COLORS).forEach(([key, color]) => {
     const boxes = layers[key] || [];
     for (const box of boxes) {
@@ -590,6 +707,14 @@ function layoutParts() {
       ? new THREE.Quaternion(part.quat[0], part.quat[1], part.quat[2], part.quat[3])
       : new THREE.Quaternion());
   });
+  // 钉在模型件上的点位标记（目前是炮塔）要跟着一起分解，不然一拉就脱位
+  boxMeshes.forEach((mesh) => {
+    const part = mesh.userData.anchor;
+    if (!part) return;
+    const scale = part.role === 'body' ? 1 : k;
+    mesh.position.copy(toVec3(part.loc)).multiplyScalar(scale);
+    mesh.position.y += (part.role === 'body' ? 0 : state.explode * 0.6);
+  });
 }
 
 /* ---------------------------- 命中盒 ---------------------------- */
@@ -603,19 +728,51 @@ function boxColor(name, ignore) {
   return COLORS.side;
 }
 
+/**
+ * 零体积「点位」命中盒（炮塔、防爆装甲等）在蓝图里没有自己的坐标，
+ * translation 全是 0。能对上外观件的（炮塔 → role=turret）就钉在对应件上，
+ * 对不上的返回 null：宁可不在场景里画，也不要在车体正中央丢一个看不出是什么的点。
+ */
+function pointAnchor(box) {
+  const kind = ((state.vehicle.parts || []).find((p) => p.id === box.instance) || {}).kind || '';
+  const roles = /炮塔|武器站/.test(kind) ? ['turret', 'gun'] : [];
+  for (const role of roles) {
+    const part = (state.vehicle.modelParts || []).find((p) => p.role === role);
+    if (part && part.loc) return part;
+  }
+  return null;
+}
+
+/** 命中盒在场景里的落点（分解视图的偏移也会算进去）；无体积又对不上模型的返回 null。 */
+function boxAnchorVec(box) {
+  if (!box.point) return toVec3(box.translation);
+  const part = pointAnchor(box);
+  if (!part) return null;
+  const scale = part.role === 'body' ? 1 : 1 + state.explode * 1.6;
+  const v = toVec3(part.loc).multiplyScalar(scale);
+  v.y += part.role === 'body' ? 0 : state.explode * 0.6;
+  return v;
+}
+
 function buildHitBoxes() {
   boxGroup.clear();
   boxMeshes = [];
   state.vehicle.hitBoxes.forEach((box, index) => {
     if (box.point) {
       // 零体积的“点位”（炮塔点、装甲部件点）：画个小八面体标记
+      const anchor = boxAnchorVec(box);
+      if (!anchor) return;                      // 没有可对位的模型件就不画
       const marker = new THREE.Mesh(
-        new THREE.OctahedronGeometry(0.11),
-        new THREE.MeshBasicMaterial({ color: COLORS.turret, transparent: true, opacity: 0.95 }),
+        new THREE.OctahedronGeometry(0.16),
+        // 点位是标记不是几何体：关掉深度测试，免得埋在炮塔模型里面看不见
+        new THREE.MeshBasicMaterial({
+          color: COLORS.turret, transparent: true, opacity: 0.95, depthTest: false,
+        }),
       );
-      marker.position.copy(toVec3(box.translation));
+      marker.position.copy(anchor);
       marker.quaternion.copy(toQuat(box.rotation));
       marker.userData.index = index;
+      marker.userData.anchor = pointAnchor(box); // 分解视图里要跟着炮塔一起走
       boxGroup.add(marker);
       boxMeshes.push(marker);
       return;
@@ -659,7 +816,7 @@ function applyBoxAlpha() {
 
 /* ---------------------------- 相机 ---------------------------- */
 
-function computeBounds() {
+function computeBounds(vehicle) {
   const box = new THREE.Box3();
   let has = false;
   (modelGroup.userData.parts || []).forEach(({ part }) => {
@@ -676,7 +833,7 @@ function computeBounds() {
     box.union(local.applyMatrix4(matrix));
     has = true;
   });
-  (state.vehicle.hitBoxes || []).forEach((b) => {
+  (vehicle.hitBoxes || []).forEach((b) => {
     const half = new THREE.Vector3(
       Math.abs(b.extent[0] || 0) * S, Math.abs(b.extent[2] || 0) * S, Math.abs(b.extent[1] || 0) * S,
     );
@@ -685,13 +842,13 @@ function computeBounds() {
     has = true;
   });
   // 轮组、履带、撞击碰撞盒也要包进来，不然相机可能切掉它们
-  (state.vehicle.modelWheels || []).forEach((group) => {
+  (vehicle.modelWheels || []).forEach((group) => {
     group.transforms.forEach((transform) => {
       box.union(localBox(group.min, group.max, transform.loc, transform.quat, transform.scale));
       has = true;
     });
   });
-  (state.vehicle.modelTracks || []).forEach((track) => {
+  (vehicle.modelTracks || []).forEach((track) => {
     const offset = toVec3(track.loc);
     track.points.forEach((point) => {
       const world = toVec3(point).add(offset);
@@ -700,7 +857,7 @@ function computeBounds() {
     });
   });
   ['impact', 'chassis'].forEach((key) => {
-    ((state.vehicle.collisionLayers || {})[key] || []).forEach((entry) => {
+    ((vehicle.collisionLayers || {})[key] || []).forEach((entry) => {
       box.union(localBox(
         [-entry.extent[0] * S, -entry.extent[1] * S, -entry.extent[2] * S],
         [entry.extent[0] * S, entry.extent[1] * S, entry.extent[2] * S],
@@ -865,12 +1022,18 @@ function translateDebuff(key) {
 
 function renderVehicleInfo() {
   const v = state.vehicle;
+  // 有些车（玩家版武直、攻击艇）客户端里没有独立碰撞网格，子弹判定走外观网格本体，
+  // 直接说清楚，免得用户以为是我们的数据缺了或者「只有一个小盒子」。
+  const collisionNote = (v.collisionMeshes || []).length
+    ? `${(v.collisionMeshes || []).length} 份`
+    : '无（该车没有独立碰撞网格，子弹判定按外观网格本体算）';
   document.getElementById('vehicleInfo').innerHTML = `
     <div class="card">
       <h3>${v.name}</h3>
       <div>
         <span class="pill">${v.category}</span>
         <span class="pill">${v.domain}</span>
+        <span class="pill">${v.mode || '全面战场'}</span>
         <span class="pill">${v.armor || '—'}</span>
       </div>
       <div class="kv" style="margin-top:8px">
@@ -880,11 +1043,8 @@ function renderVehicleInfo() {
         <span>爆炸伤害承受</span><span>${v.explodeRate ?? '—'}</span>
         <span>低血量提示</span><span>${v.lowHpRatio ?? '—'}</span>
         <span>外观网格</span><span>${(v.modelParts || []).filter((p) => !p.unplaced).length} 件</span>
+        <span>实车碰撞体</span><span>${collisionNote}</span>
       </div>
-      ${(v.modelParts || []).some((p) => p.unplaced) ? `<div class="owner">
-        另有 ${(v.modelParts || []).filter((p) => p.unplaced).length} 个部件（
-        ${(v.modelParts || []).filter((p) => p.unplaced).map((p) => p.name).join('、')}）
-        蓝图里没有给位置，运行时才由起落架/倾转系统摆放，这里不画以免穿模。</div>` : ''}
     </div>
     <div class="card">
       <h3>独立部位（${v.parts.length}）</h3>
@@ -902,7 +1062,9 @@ function renderBoxList() {
   const list = v.hitBoxes.map((box, index) => `
     <div class="box-row ${index === state.selectedBoxIndex ? 'active' : ''}" data-index="${index}">
       <span>${box.name}</span>
-      <span class="scaling">${box.point ? '点位' : `×${box.scaling}`}${box.ignore ? ' · 不结算' : ''}</span>
+      <span class="scaling">${box.point
+        ? (pointAnchor(box) ? '点位 · 已贴到模型件' : '点位 · 无体积')
+        : `×${box.scaling}`}${box.ignore ? ' · 不结算' : ''}</span>
     </div>`).join('');
   boxListEl = document.getElementById('boxListCard');
   const volumes = v.hitBoxes.filter((b) => !b.point).length;
@@ -966,6 +1128,10 @@ function renderTable() {
     renderPlainTable(area, state.data.repair);
     return;
   }
+  if (state.tableTab === 'collision') {
+    renderPlainTable(area, state.data.collisionRules);
+    return;
+  }
   if (state.tableTab === 'sim') {
     renderSimulator(area);
     return;
@@ -1004,11 +1170,86 @@ function entryComponents(row) {
     armor = {};
     Object.entries(byArmor).forEach(([k, v]) => { armor[k] = v / base; });
   }
-  return [{ kind: row.kind || '直击', base, armor: armor || {} }];
+  return [{
+    kind: row.kind || '直击', base, armor: armor || {},
+    minBase: row.minBase, fullRadius: row.fullRadius, explodeRadius: row.explodeRadius,
+  }];
+}
+
+/** 这件东西在「爆心距离」多远之内还是满伤（取各爆炸段里最大的满伤→边缘区间）。 */
+function blastRange(row) {
+  const edge = Math.max(0, ...entryComponents(row)
+    .filter((p) => p.kind === '爆炸')
+    .map((p) => Number(p.explodeRadius) || 0));
+  const full = Math.max(0, ...entryComponents(row)
+    .filter((p) => p.kind === '爆炸')
+    .map((p) => Number(p.fullRadius) || 0));
+  return edge > full ? { full, edge } : null;
+}
+
+/** 爆炸段的半径衰减：满伤半径内给满额，边缘半径外给最小值，中间线性插值。 */
+function blastFalloff(part, distance) {
+  const base = Number(part.base || 0);
+  const min = part.minBase == null ? base : Number(part.minBase);
+  const full = Number(part.fullRadius);
+  const edge = Number(part.explodeRadius);
+  if (!Number.isFinite(full) || !Number.isFinite(edge) || edge <= full) return base;
+  if (!(distance > full)) return base;
+  if (distance >= edge) return min;
+  return base + (min - base) * ((distance - full) / (edge - full));
+}
+
+/**
+ * 对干员的伤害：直击段给生命伤害，爆炸段给人物伤害。
+ * 和打载具完全是两套数值，这里只给每发的原始值（全面战场没有干员护甲）。
+ */
+function personRows(row, distance) {
+  const parts = (row.components || []).length ? row.components : [row];
+  const rows = [];
+  parts.forEach((p) => {
+    const isExplode = p.kind === '爆炸' || (p.kind === undefined && (row.kind || '') === '爆炸');
+    if (isExplode) {
+      const base = Number(p.personDamage ?? row.personDamage ?? 0);
+      const min = Number(p.minPersonDamage ?? row.minPersonDamage ?? base);
+      const value = blastFalloff({ ...p, base, minBase: min }, distance);
+      if (value > 0) rows.push({ kind: '爆炸', health: null, armor: null, person: value });
+      return;
+    }
+    const health = p.healthDamage ?? row.healthDamage;
+    if ((health || 0) > 0) {
+      rows.push({ kind: p.kind || '直击', health, person: null });
+    }
+  });
+  return rows;
+}
+
+function personHtml(row, distance, note) {
+  const rows = personRows(row, distance);
+  if (!rows.length) return '';
+  const body = rows.map((r) => `<tr>
+      <td>${r.kind}</td>
+      <td class="num">${r.health == null ? '—' : round1(r.health)}</td>
+      <td class="num">${r.person == null ? '—' : round1(r.person)}</td>
+    </tr>`).join('');
+  const totalHealth = rows.reduce((n, r) => n + (r.health || 0), 0);
+  const totalPerson = rows.reduce((n, r) => n + (r.person || 0), 0);
+  return `
+    <div class="explainbox simnote">
+      <div class="formula">对干员（每发，和打载具是两套数值）</div>
+      <table class="damagetable simtable">
+        <thead><tr><th>段</th><th class="num">生命伤害</th>
+        <th class="num">爆炸·人物伤害</th></tr></thead>
+        <tbody>${body}<tr class="clickable"><td><b>合计</b></td>
+          <td class="num"><b>${round1(totalHealth)}</b></td>
+          <td class="num"><b>${round1(totalPerson)}</b></td></tr></tbody>
+      </table>
+      <div class="owner">直击段还会乘健康部位倍率，爆炸段按落点距离衰减 ——
+      本表给的是没乘这些之前的原始值（全面战场模式没有干员护甲）。${note || ''}</div>
+    </div>`;
 }
 
 /** 按实测验证过的口径算一次命中。 */
-function simulateHit(row, vehicle, box, angleScale) {
+function simulateHit(row, vehicle, box, angleScale, distance = 0) {
   const key = vehicle.armorKey || 'Default';
   const hp = vehicle.hp || 1000;
   const scaling = box ? box.scaling : 1;
@@ -1019,14 +1260,20 @@ function simulateHit(row, vehicle, box, angleScale) {
     const isExplode = part.kind === '爆炸';
     const multiplier = isExplode ? radius : scaling;
     const angle = isExplode ? 1 : angleScale;
+    const effectiveBase = isExplode ? blastFalloff(part, distance) : Number(part.base || 0);
     return {
       kind: part.kind,
-      base: part.base,
+      base: effectiveBase,
+      baseFull: Number(part.base || 0),
       coefficient: coef,
       multiplier,
       angle,
-      damage: part.base * coef * multiplier * angle,
-      note: isExplode ? '爆炸段走爆炸衰减倍率，不吃部位与角度' : '直击段吃部位倍率与入射角',
+      damage: effectiveBase * coef * multiplier * angle,
+      note: isExplode
+        ? (distance > (Number(part.fullRadius) || 0)
+          ? `爆心 ${round1(distance)} 米：按半径衰减后的值（满伤 ${round1(Number(part.fullRadius) || 0)} 米 → 边缘 ${round1(Number(part.explodeRadius) || 0)} 米）`
+          : '爆炸段走爆炸衰减倍率，不吃部位与角度')
+        : '直击段吃部位倍率与入射角',
     };
   });
   const total = rows.reduce((sum, r) => sum + r.damage, 0);
@@ -1044,7 +1291,10 @@ function renderSimulator(area) {
   const chosen = findEntryByName(sim.name);
   const box = sim.boxIndex >= 0 ? boxes[sim.boxIndex] : null;
   const angle = ANGLE_MODES[sim.angle] || ANGLE_MODES[0];
-  const result = chosen ? simulateHit(chosen.row, vehicle, box, angle.scale) : null;
+  // 爆心距离：只有带爆炸段、且满伤半径 < 边缘半径的条目才有得调
+  const blast = chosen ? blastRange(chosen.row) : null;
+  sim.distance = blast ? Math.min(Math.max(sim.distance || 0, 0), blast.edge) : 0;
+  const result = chosen ? simulateHit(chosen.row, vehicle, box, angle.scale, sim.distance) : null;
 
   const boxChips = [
     `<button class="chip ${sim.boxIndex === -1 ? 'on' : ''}" data-box="-1"
@@ -1057,7 +1307,7 @@ function renderSimulator(area) {
     data-angle="${i}" title="${mode.hint}">${mode.label}</button>`).join('');
 
   const list = entries.map((item) =>
-    `<option value="${item.row.name}">${item.table === 'weapons' ? '载具武器' : '步兵/干员道具'}</option>`).join('');
+    `<option value="${item.row.name}">${item.table === 'weapons' ? '载具武器' : '步兵技能'}</option>`).join('');
 
   area.innerHTML = `
     <div class="simwrap">
@@ -1075,8 +1325,13 @@ function renderSimulator(area) {
         </div>
         <div class="row"><span class="lbl">打哪</span><div class="chiprow">${boxChips}</div></div>
         <div class="row"><span class="lbl">入射角</span><div class="chiprow">${angleChips}</div></div>
+        ${blast ? `<div class="row"><span class="lbl">爆心距离</span>
+          <input type="range" id="simDistance" min="0" max="${blast.edge}" step="0.25" value="${sim.distance}" />
+          <span class="pill" id="simDistanceLabel">${round1(sim.distance)} 米</span>
+          <span class="owner">${round1(blast.full)} 米内满伤，到 ${round1(blast.edge)} 米衰减到最小值</span>
+        </div>` : ''}
       </div>
-      <div class="simout">${result ? simResultHtml(chosen, vehicle, box, angle, result) : '没有可用的条目'}</div>
+      <div class="simout">${result ? simResultHtml(chosen, vehicle, box, angle, result, sim.distance) : '没有可用的条目'}</div>
     </div>`;
 
   const input = document.getElementById('simEntry');
@@ -1096,9 +1351,23 @@ function renderSimulator(area) {
       renderTable();
     });
   });
+  // 拖动时只刷新结果区，不整块重绘，否则滑杆会被原地重建、拖不动
+  const distInput = document.getElementById('simDistance');
+  if (distInput && chosen) {
+    const distLabel = document.getElementById('simDistanceLabel');
+    const out = area.querySelector('.simout');
+    distInput.addEventListener('input', () => {
+      state.sim.distance = Number(distInput.value);
+      if (distLabel) distLabel.textContent = `${round1(state.sim.distance)} 米`;
+      if (out) {
+        const r = simulateHit(chosen.row, vehicle, box, angle.scale, state.sim.distance);
+        out.innerHTML = simResultHtml(chosen, vehicle, box, angle, r, state.sim.distance);
+      }
+    });
+  }
 }
 
-function simResultHtml(chosen, vehicle, box, angle, result) {
+function simResultHtml(chosen, vehicle, box, angle, result, distance = 0) {
   const lines = result.rows.map((row) => `
     <tr>
       <td>${row.kind}</td>
@@ -1110,11 +1379,22 @@ function simResultHtml(chosen, vehicle, box, angle, result) {
       <td class="owner">${row.note}</td>
     </tr>`).join('');
   const factor = result.percent;
+  const hp = vehicle.hp || 1;
+  const perHit = result.total || 0;
+  const shotsToKill = perHit > 0 ? Math.ceil(hp / perHit) : null;
+  const fireInterval = Number(chosen.row.fireInterval);
+  const ttk = Number.isFinite(fireInterval) && fireInterval > 0 && shotsToKill ? fireInterval * shotsToKill : null;
+  const nice = (v) => (Number.isFinite(v) ? String(Number(v.toFixed(2))) : '—');
   return `
     <div class="simhead">
       <div><b>${chosen.row.name}</b> → ${vehicle.name}${box ? ` · ${box.name}` : ' · 车体整体'} · ${angle.label}</div>
       <div class="bignum">${round1(result.total)} <span>点</span></div>
       <div class="owner">掉 ${factor.toFixed(2)}% 总耐久　→　血条显示 <b>${result.bar.toFixed(1)}</b></div>
+      <div class="ttkline">
+        <span class="ttk-num">TTK ${ttk != null ? `${nice(ttk)} 秒` : '—'}</span>
+        <span class="ttk-num">DTK ${shotsToKill ? `${shotsToKill} 发` : '—'}</span>
+        <span class="owner">${ttk != null && shotsToKill ? `射速 ${nice(fireInterval)} 秒/发` : '（单发/无射速）'}</span>
+      </div>
     </div>
     <table class="damagetable simtable">
       <thead><tr><th>段</th><th class="num">基础</th><th class="num">护甲系数</th>
@@ -1125,7 +1405,8 @@ function simResultHtml(chosen, vehicle, box, angle, result) {
       <div class="formula">对「${vehicle.name}」的伤害 ＝ Σ（每段基础伤害 × 该弹种对${vehicle.armor || vehicle.armorKey}的系数 × 命中倍率 × 角度）</div>
       <div class="owner">口径来自实测验证：<b>直击段</b>吃命中盒伤害倍率与入射角；
       <b>爆炸段</b>只走命中盒的爆炸衰减倍率，不吃部位倍率也不吃角度（10 发定向实测里 9 发落在 ±1 个百分点内）。</div>
-    </div>`;
+    </div>
+    ${personHtml(chosen.row, distance)}`;
 }
 
 /** 当前选中的载具就是伤害的“目标”，表格按它的护甲类型现算。 */
@@ -1135,6 +1416,7 @@ function damageTarget() {
     name: vehicle?.name || '未选择载具',
     key: vehicle?.armorKey || 'Default',
     label: vehicle?.armor || '无装甲/通用',
+    hp: vehicle?.hp || 1000,
   };
 }
 
@@ -1145,13 +1427,18 @@ function renderDamageTable(area, source) {
     ? [{ key: 'name', label: '武器名称', cls: 'name' },
        { key: 'makeup', label: '伤害构成' },
        { key: 'base', label: '基础合计' },
-       { key: 'damage', label: `对「${target.name}」总伤害`, primary: true }]
+       { key: 'fireInterval', label: '射击间隔' },
+       { key: 'clipAmmo', label: '弹匣发数' },
+       { key: 'coef', label: '装甲系数' },
+       { key: 'damage', label: `对「${target.name}」总伤害`, primary: true },
+       { key: 'percent', label: '百分比伤害', primary: true }]
     : [{ key: 'name', label: '道具 / 技能', cls: 'name' },
        { key: 'owner', label: '归属' },
        { key: 'makeup', label: '伤害构成' },
        { key: 'base', label: '基础合计' },
+       { key: 'coef', label: '装甲系数' },
        { key: 'damage', label: `对「${target.name}」总伤害`, primary: true },
-       { key: 'note', label: '备注', cls: 'name' }];
+       { key: 'percent', label: '百分比伤害', primary: true }];
   if (state.showAllArmor) {
     if (isWeapon) {
       columns.push({ key: 'armorGroup', label: '装甲修正组' });
@@ -1167,14 +1454,22 @@ function renderDamageTable(area, source) {
 
   let rows = source.map((row) => {
     const parts = row.components || [];
+    const rawDamage = Number((row.damageByArmor || {})[target.key] ?? 0);
+    const rawBase = Number(row.base || 0);
     const out = {
       ...row,
       // 一件武器常常是「直击 + 命中后爆炸」两段，分别乘自己的装甲系数再相加
       makeup: parts.length
         ? parts.map((c) => `${c.kind} ${trimNum(c.base)}`).join(' ＋ ')
-        : row.kind || '',
+        : (row.damageType === 'Buff' ? '持续伤害（状态，无每发直击值）' : row.kind || ''),
+      // 燃烧弹这类走状态系统的条目没有每发数值，不该被当成「对本车无效」划掉
+      isState: row.damageType === 'Buff',
       base: trimNum(row.base),
-      damage: trimNum((row.damageByArmor || {})[target.key]),
+      fireInterval: row.fireInterval == null ? '' : String(Math.round(Number(row.fireInterval) * 100) / 100),
+      clipAmmo: row.clipAmmo == null || Number(row.clipAmmo) >= 65535 ? '' : String(row.clipAmmo),
+      damage: trimNum(rawDamage),
+      percent: rawDamage / (target.hp || 1) * 100,
+      coef: rawBase > 0 ? rawDamage / rawBase : 0,
       armorGroup: parts.length
         ? parts.map((c) => c.armorGroup || '').filter(Boolean).join(' / ')
         : (row.armorGroup || ''),
@@ -1187,7 +1482,7 @@ function renderDamageTable(area, source) {
     return out;
   });
   const total = rows.length;
-  if (state.hideZero) rows = rows.filter((r) => Number(r.damage) > 0);
+  if (state.hideZero) rows = rows.filter((r) => Number(r.damage) > 0 || r.isState);
 
   const sortKey = state.sort[state.tableTab];
   const sortList = (list) => {
@@ -1205,16 +1500,31 @@ function renderDamageTable(area, source) {
 
   const cellHtml = (row, column) => {
     const value = row[column.key] ?? '';
-    const zero = Number(row.damage) === 0;
+    const zero = Number(row.damage) === 0 && !row.isState;
     if (column.key === 'damage') {
       return `<td class="num primary${zero ? ' zero' : ''}">${value}</td>`;
+    }
+    if (column.key === 'percent') {
+      return `<td class="num primary${zero ? ' zero' : ''}">${value === '' ? '—' : `${trimNum(value)}%`}</td>`;
+    }
+    if (column.key === 'coef') {
+      const num = Number(value);
+      const text = Number.isFinite(num) ? String(Math.round(num * 1000) / 1000) : '—';
+      return `<td class="num${zero ? ' zero' : ''}">×${text}</td>`;
+    }
+    if (column.key === 'fireInterval') {
+      // 射击间隔给两位小数：像 25mm 机炮这种 0.05 秒的，只留一位就分不出来
+      return `<td class="num">${value === '' ? '—' : `${value} 秒`}</td>`;
+    }
+    if (column.key === 'clipAmmo') {
+      return `<td class="num">${value === '' ? '弹链' : value}</td>`;
     }
     const numeric = typeof value === 'number';
     return `<td class="${numeric ? 'num' : (column.cls || '')}${numeric && value === 0 ? ' zero' : ''}">${value}</td>`;
   };
 
   const rowHtml = (row, vehicleCell = '') => {
-    const zero = Number(row.damage) === 0;
+    const zero = Number(row.damage) === 0 && !row.isState;
     return `<tr class="${zero ? 'ineffective' : ''} clickable" data-name="${row.name}"
       title="点这一行，把它送进「命中模拟」算具体部位的伤害">`
       + vehicleCell
@@ -1246,13 +1556,18 @@ function renderDamageTable(area, source) {
       rowHtml(row, i === 0 ? `<td class="vcell" rowspan="${g.rows.length}">${g.vehicle}</td>` : '')).join('')).join('');
     tablesHtml = `<table class="damagetable"><thead>${headHtml(true)}</thead><tbody>${tbody}</tbody></table>`;
   } else {
-    const gadgetBlock = (title, list) =>
-      `<div class="gblock"><div class="gblock-title">${title}（${list.length}）</div>`
-      + `<table class="damagetable"><thead>${headHtml(false)}</thead><tbody>`
-      + list.map((r) => rowHtml(r)).join('') + '</tbody></table></div>';
-    const tactical = sortList(rows.filter((r) => r.group === '战术道具'));
-    const operator = sortList(rows.filter((r) => r.group !== '战术道具'));
-    tablesHtml = gadgetBlock('战术道具', tactical) + gadgetBlock('干员道具', operator);
+    // 四组共用同一张表 + 分组标题行，保证「不同组之间相同列」严格对齐
+    const groups = [
+      ['战术道具', sortList(rows.filter((r) => r.group === '战术道具'))],
+      ['干员道具', sortList(rows.filter((r) => r.group === '干员道具'))],
+      ['阵地支援', sortList(rows.filter((r) => r.group === '阵地支援'))],
+      ['场景武器', sortList(rows.filter((r) => r.group === '场景武器'))],
+    ].filter(([, list]) => list.length > 0);
+    const colspan = columns.length + 1; // +1 是行首的「无效」小格
+    const body = groups.map(([title, list]) =>
+      `<tr class="grouptitle-row"><td colspan="${colspan}">${title}（${list.length}）</td></tr>`
+      + list.map((r) => rowHtml(r)).join('')).join('');
+    tablesHtml = `<table class="damagetable"><thead>${headHtml(false)}</thead><tbody>${body}</tbody></table>`;
   }
 
   area.innerHTML = `
@@ -1260,7 +1575,7 @@ function renderDamageTable(area, source) {
       <div class="tinfo">
         <span class="tcur">当前目标：<b>${target.name}</b></span>
         <span class="pill">${target.label}</span>
-        <code>对${target.name}的伤害 ＝ 基础载具伤害 × 装甲修正组[${target.label}]</code>
+        <code>对${target.name}的伤害 ＝ 基础载具伤害 × 装甲系数</code>
       </div>
       <div class="tacts">
         <label><input type="checkbox" id="hideZero" ${state.hideZero ? 'checked' : ''} /> 隐藏无效条目</label>
@@ -1332,10 +1647,33 @@ function explainHtml() {
 function renderPlainTable(area, source) {
   if (!source || !source.length) { area.innerHTML = '暂无数据'; return; }
   const columns = Object.keys(source[0]);
+  const nameKey = '载具名称';
   const head = columns.map((c) => `<th>${c}</th>`).join('');
-  const body = source.map((row) => `<tr>${
-    columns.map((c) => `<td>${row[c] ?? ''}</td>`).join('')}</tr>`).join('');
-  area.innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+  const selected = state.vehicle?.name || '';
+  // 选中载具的数值组置顶并高亮，其余按载具名排序
+  const ordered = [...source].sort((a, b) => {
+    const aSel = a[nameKey] === selected ? 0 : 1;
+    const bSel = b[nameKey] === selected ? 0 : 1;
+    if (aSel !== bSel) return aSel - bSel;
+    return String(a[nameKey] ?? '').localeCompare(String(b[nameKey] ?? ''), 'zh');
+  });
+  // 第一列（载具名称）合并相同格
+  const body = [];
+  for (let i = 0; i < ordered.length; i += 1) {
+    const row = ordered[i];
+    const isSel = row[nameKey] === selected;
+    const isFirst = i === 0 || ordered[i - 1][nameKey] !== row[nameKey];
+    let count = 1;
+    while (i + count < ordered.length && ordered[i + count][nameKey] === row[nameKey]) count += 1;
+    const cells = [];
+    columns.forEach((c, ci) => {
+      if (ci === 0 && !isFirst) return;  // 被 rowspan 覆盖，跳过
+      const span = ci === 0 ? ` class="name-cell" rowspan="${count}"` : '';
+      cells.push(`<td${span}>${row[c] ?? ''}</td>`);
+    });
+    body.push(`<tr class="${isSel ? 'selected-row' : ''}">${cells.join('')}</tr>`);
+  }
+  area.innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${body.join('')}</tbody></table>`;
 }
 
 /* ---------------------------- 渲染循环 ---------------------------- */
@@ -1362,7 +1700,12 @@ function updateLabels() {
       labelLayer.appendChild(node);
     }
     node.textContent = `${box.name} ×${box.scaling}`;
-    const position = toVec3(box.translation).project(activeCamera);
+    const anchor = boxAnchorVec(box);
+    if (!anchor) {                 // 无体积又对不上模型的点位（如防爆装甲），不挂标签
+      node.style.display = 'none';
+      return;
+    }
+    const position = anchor.project(activeCamera);
     const x = (position.x * 0.5 + 0.5) * rect.width;
     const y = (-position.y * 0.5 + 0.5) * rect.height;
     const visible = state.showBoxes && position.z < 1 && x > 0 && y > 0 && x < rect.width && y < rect.height;
