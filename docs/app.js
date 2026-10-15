@@ -65,7 +65,7 @@ const texLoader = new THREE.TextureLoader();
 const textureCache = new Map();
 
 /* 构建版本：改动后 +1，拼到请求上，避免浏览器 / 内嵌 WebView 缓存旧模型包与旧数据 */
-const APP_BUILD = '20261014.4';
+const APP_BUILD = '20261015.10';
 const bust = (u) => (/\?/.test(u) ? u + '&v=' : u + '?v=') + APP_BUILD;
 
 /* ---------------------------- MFPK 打包加载 ---------------------------- */
@@ -1129,7 +1129,7 @@ function renderTable() {
     return;
   }
   if (state.tableTab === 'collision') {
-    renderPlainTable(area, state.data.collisionRules);
+    renderCollisionTable(area, state.data.collisionRules);
     return;
   }
   if (state.tableTab === 'sim') {
@@ -1674,6 +1674,38 @@ function renderPlainTable(area, source) {
     body.push(`<tr class="${isSel ? 'selected-row' : ''}">${cells.join('')}</tr>`);
   }
   area.innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${body.join('')}</tbody></table>`;
+}
+
+/** 碰撞规则专用：撞车列按速度区间换行，载具名与碾压步兵列跨行合并。 */
+function renderCollisionTable(area, source) {
+  if (!source || !source.length) { area.innerHTML = '暂无数据'; return; }
+  const nameKey = '载具名称';
+  const keys = Object.keys(source[0]).filter((k) => k !== nameKey);
+  const crushKey = keys.find((k) => k.includes('碾压')) || keys[0];
+  const ramKey = keys.find((k) => k.includes('撞车')) || keys[1];
+  const selected = state.vehicle?.name || '';
+  const ordered = [...source].sort((a, b) => {
+    const aSel = a[nameKey] === selected ? 0 : 1;
+    const bSel = b[nameKey] === selected ? 0 : 1;
+    if (aSel !== bSel) return aSel - bSel;
+    return String(a[nameKey] ?? '').localeCompare(String(b[nameKey] ?? ''), 'zh');
+  });
+  const body = [];
+  for (const row of ordered) {
+    const isSel = row[nameKey] === selected;
+    const trCls = isSel ? ' class="selected-row"' : '';
+    const segments = String(row[ramKey] ?? '').split('；').filter((s) => s.trim());
+    const n = Math.max(1, segments.length);
+    body.push(`<tr${trCls}>`
+      + `<td class="name-cell" rowspan="${n}">${row[nameKey] ?? ''}</td>`
+      + `<td rowspan="${n}">${row[crushKey] ?? ''}</td>`
+      + `<td>${segments[0] ?? ''}</td></tr>`);
+    for (let i = 1; i < n; i += 1) {
+      body.push(`<tr${trCls}><td>${segments[i] ?? ''}</td></tr>`);
+    }
+  }
+  const head = `<tr><th>${nameKey}</th><th>${crushKey}</th><th>${ramKey}</th></tr>`;
+  area.innerHTML = `<table><thead>${head}</thead><tbody>${body.join('')}</tbody></table>`;
 }
 
 /* ---------------------------- 渲染循环 ---------------------------- */
